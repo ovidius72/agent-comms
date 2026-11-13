@@ -10,6 +10,7 @@
 
 import { bytesToHex, deviceIdToHex } from "wire-mesh-core/domain/device-id";
 import { GroupProofs } from "./group-proofs.js";
+import { DeliveryReceipts } from "./delivery-persistence.js";
 import { Naming } from "./naming.js";
 import { Petnames } from "./petnames.js";
 import {
@@ -77,12 +78,7 @@ import type {
   TransportEvents,
 } from "./transport.js";
 import { createTransportEvents } from "./transport-events.js";
-import type {
-  CommsStore,
-  SendRoomMessageOptions,
-  SentDm,
-  SentRoomMessage,
-} from "./comms-store.js";
+import type { CommsStore, SentDm, SentRoomMessage } from "./comms-store.js";
 import type { CapabilityToken } from "wire-mesh-core/generated/protocol";
 import type {
   AgentIdentity,
@@ -95,7 +91,6 @@ import type {
   Room,
   RoomMessage,
   RoomType,
-  StreamingBehavior,
   Visibility,
 } from "./types.js";
 
@@ -295,6 +290,7 @@ export class MeshStore implements CommsStore {
   }
 
   constructor(options?: Readonly<MeshStoreOptions>) {
+    const deliveryReceipts = new DeliveryReceipts(options?.deliveryPersistence);
     const {
       coordinatorPort = DEFAULT_COORDINATOR_PORT,
       hubUrl,
@@ -355,6 +351,7 @@ export class MeshStore implements CommsStore {
     });
 
     this.roomProtocol = new RoomProtocol({
+      deliveryReceipts,
       rooms: this.rooms,
       messages: this.messages,
       dms: this.dms,
@@ -371,6 +368,7 @@ export class MeshStore implements CommsStore {
     });
 
     this.roomMessaging = new RoomMessaging({
+      deliveryReceipts,
       rooms: this.rooms,
       messages: this.messages,
       dms: this.dms,
@@ -756,12 +754,9 @@ export class MeshStore implements CommsStore {
   // -----------------------------------------------------------------------
 
   async sendRoomMessage(
-    roomId: string,
-    from: string,
-    content: string,
-    options?: SendRoomMessageOptions,
+    ...args: Parameters<RoomMessaging["sendRoomMessage"]>
   ): Promise<SentRoomMessage> {
-    return this.roomMessaging.sendRoomMessage(roomId, from, content, options);
+    return this.roomMessaging.sendRoomMessage(...args);
   }
 
   async readRoomMessages(
@@ -775,13 +770,8 @@ export class MeshStore implements CommsStore {
   // CommsStore — DMs
   // -----------------------------------------------------------------------
 
-  async sendDm(
-    from: string,
-    to: string,
-    content: string,
-    streamingBehavior?: StreamingBehavior,
-  ): Promise<SentDm> {
-    return this.roomMessaging.sendDm(from, to, content, streamingBehavior);
+  async sendDm(...args: Parameters<RoomMessaging["sendDm"]>): Promise<SentDm> {
+    return this.roomMessaging.sendDm(...args);
   }
 
   // -----------------------------------------------------------------------

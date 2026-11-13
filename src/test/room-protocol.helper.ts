@@ -16,6 +16,7 @@ import { generateIdentity } from "../core/identity.js";
 import { loadOrCreateIdentity } from "../core/identity-store.js";
 import { toIdentityPort } from "../core/wire-mesh-identity.js";
 import { RoomProtocol, type RoomProtocolDeps } from "../core/room-protocol.js";
+import { DeliveryReceipts } from "../core/delivery-persistence.js";
 import { randomId } from "../core/random-id.js";
 import type { AgentIdentity, Room } from "../core/types.js";
 import { scratchDirectory } from "./scratch-directory.helper.js";
@@ -151,6 +152,7 @@ export async function makeHarness(): Promise<Harness> {
     .mockResolvedValue({ result: "ok" } satisfies ManageOutcome);
 
   const deps: RoomProtocolDeps = {
+    deliveryReceipts: new DeliveryReceipts(),
     rooms: new Map(),
     messages: new Map(),
     dms: new Map(),

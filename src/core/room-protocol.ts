@@ -55,6 +55,12 @@ import type { DeliveryEngine } from "./delivery-engine.js";
 import type { RoomVerbHandler } from "./room-router.js";
 import type { ConnectionHandle, MeshTransport } from "./transport.js";
 import { z } from "zod";
+import { recordReceivedMessage } from "./message-history.js";
+import {
+  type DeliveryReceipts,
+  PERSISTED_SEND_VERB,
+  type MessageEvent,
+} from "./delivery-persistence.js";
 import { DeliveryEventSchema, StreamingBehavior } from "./types.js";
 import type {
   AgentIdentity,
@@ -79,7 +85,8 @@ interface PendingRoomRequest {
 function messageIdFromParams(
   params: Readonly<Record<string, unknown>>,
 ): string | undefined {
-  if (params.verb !== "room.send") return undefined;
+  if (params.verb !== "room.send" && params.verb !== PERSISTED_SEND_VERB)
+    return undefined;
   const raw = params["message-id"];
   return raw instanceof Uint8Array ? bytesToHex(raw) : undefined;
 }
@@ -89,6 +96,7 @@ const RoomNotifyParamsSchema = z.object({ event: DeliveryEventSchema });
 
 /** The state and collaborators RoomProtocol needs from MeshStore. rooms/messages/dms/agents/dmRequestsInitiatedByMe are direct references into MeshStore's own fields; deliveryEngine is the already-constructed instance, narrowed to what a room-verb handler ever needs; revokeMemberGrant is deferred (RoomLifecycle, which owns it, doesn't exist yet when RoomProtocol is constructed -- construction order: ... -\> roomProtocol -\> roomMessaging -\> roomLifecycle -\> ...), wired the same lazy-`this`-capture way DeliveryEngine's own sendRoomRequestToMember closure is. */
 export interface RoomProtocolDeps {
+  deliveryReceipts: DeliveryReceipts;
   rooms: Map<string, Room>;
   messages: Map<string, RoomMessage[]>;
   dms: Map<string, DmMessage[]>;
@@ -139,6 +147,8 @@ export class RoomProtocol {
         this.handleRoomJoin(request, handle),
       "room.send": async (request, handle) =>
         this.handleRoomSend(request, handle),
+      [PERSISTED_SEND_VERB]: async (request, handle) =>
+        this.handleRoomSend(request, handle, true),
       "room.read": async (request, handle) =>
         this.handleRoomRead(request, handle),
       "room.members": async (request, handle) =>
@@ -175,6 +185,7 @@ export class RoomProtocol {
   private async handleRoomSend(
     request: IncomingManageRequest,
     handle: Readonly<ConnectionHandle>,
+    requirePersistence = false,
   ): Promise<ManageOutcome> {
     const roomPath = request.scope.path;
     if (roomPath === undefined) {
@@ -195,54 +206,55 @@ export class RoomProtocol {
       return { result: "error", code: "unauthorized" };
     }
 
-    const parsedParams = roomSendSchema.safeParse(request.command.params);
+    const parsedParams = roomSendSchema.safeParse(
+      requirePersistence
+        ? { ...request.command.params, verb: "room.send" }
+        : request.command.params,
+    );
     if (!parsedParams.success) {
       return { result: "error", code: "malformed_params" };
     }
     const params = parsedParams.data;
     const replyTo = RoomProtocol.replyToFromRefs(params.refs);
     const streamingBehavior = RoomProtocol.streamingBehaviorFromParams(params);
-    const id = bytesToHex(params["message-id"]);
-    const timestamp = new Date(params["sent-at"]).toISOString();
     const peerId = this.deps.getPeerId();
+    const message = {
+      id: bytesToHex(params["message-id"]),
+      from: handle.id,
+      content: params.text,
+      timestamp: new Date(params["sent-at"]).toISOString(),
+      readBy: [handle.id],
+      ...(streamingBehavior !== undefined && { streamingBehavior }),
+    };
+    const event: MessageEvent =
+      parseRoomPath(roomPath).kind === "dm"
+        ? { type: "dm", message: { ...message, to: peerId } }
+        : {
+            type: "room_message",
+            message: {
+              ...message,
+              room: roomPath,
+              ...(replyTo !== undefined && { replyTo }),
+            },
+          };
 
-    const parsedPath = parseRoomPath(roomPath);
-    let event: DeliveryEvent;
-    if (parsedPath.kind === "dm") {
-      const message: DmMessage = {
-        id,
-        from: handle.id,
-        to: peerId,
-        content: params.text,
-        timestamp,
-        readBy: [handle.id],
-        ...(streamingBehavior !== undefined && { streamingBehavior }),
-      };
-      const history = this.deps.dms.get(roomPath) ?? [];
-      history.push(message);
-      this.deps.dms.set(roomPath, history);
-      event = { type: "dm", message };
-    } else {
-      const message: RoomMessage = {
-        id,
-        from: handle.id,
-        room: roomPath,
-        content: params.text,
-        timestamp,
-        readBy: [handle.id],
-        ...(replyTo !== undefined && { replyTo }),
-        ...(streamingBehavior !== undefined && { streamingBehavior }),
-      };
-      const history = this.deps.messages.get(roomPath) ?? [];
-      history.push(message);
-      this.deps.messages.set(roomPath, history);
-      event = { type: "room_message", message };
-    }
-
+    const receipt = await this.deps.deliveryReceipts.accept(
+      roomPath,
+      peerId,
+      event,
+      requirePersistence,
+    );
+    if (!receipt.ok) return { result: "error", code: receipt.code };
+    const answer = {
+      result: "ok" as const,
+      ...(receipt.persisted && { "delivery-receipt": "persisted" }),
+    };
+    if (receipt.duplicate) return answer;
+    recordReceivedMessage(event, roomPath, this.deps);
     this.deps.deliveryEngine.queueDelivery(peerId, event);
     this.deps.deliveryEngine.fireLocalDelivery(peerId, event);
 
-    return { result: "ok" };
+    return answer;
   }
 
   /**
@@ -506,6 +518,13 @@ export class RoomProtocol {
     } catch {
       return { kind: "undelivered", reason: "connection_lost" };
     }
+    if (
+      params.verb === PERSISTED_SEND_VERB &&
+      outcome.result === "ok" &&
+      outcome["delivery-receipt"] !== "persisted"
+    ) {
+      return { kind: "refused", code: "delivery_persistence_unsupported" };
+    }
     return classifyManageOutcome(outcome);
   }
 
@@ -559,7 +578,10 @@ export class RoomProtocol {
         pending.params,
       );
       if (outcome.kind === "delivered") {
-        this.reportDelivery(memberId, pending, { status: "delivered" });
+        this.reportDelivery(memberId, pending, {
+          status: "delivered",
+          ...(outcome.persisted === true && { persisted: true }),
+        });
       } else if (outcome.kind === "refused") {
         this.reportDelivery(memberId, pending, {
           status: "refused",

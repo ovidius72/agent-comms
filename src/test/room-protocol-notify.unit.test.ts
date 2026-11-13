@@ -16,6 +16,7 @@ import { loadOrCreateIdentity } from "../core/identity-store.js";
 import { toIdentityPort } from "../core/wire-mesh-identity.js";
 import { ownerNamedRoomPath } from "../core/room-path.js";
 import { RoomProtocol, type RoomProtocolDeps } from "../core/room-protocol.js";
+import { DeliveryReceipts } from "../core/delivery-persistence.js";
 import { randomId } from "../core/random-id.js";
 import type { DeliveryEvent, Room } from "../core/types.js";
 import { scratchDirectory } from "./scratch-directory.helper.js";
@@ -100,6 +101,7 @@ async function makeHarness(): Promise<Harness> {
     vi.fn<RoomProtocolDeps["deliveryEngine"]["fireLocalDelivery"]>();
 
   const deps: RoomProtocolDeps = {
+    deliveryReceipts: new DeliveryReceipts(),
     rooms: new Map(),
     messages: new Map(),
     dms: new Map(),

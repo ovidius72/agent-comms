@@ -5,7 +5,14 @@
 import { bytesFromHex, bytesToHex } from "wire-mesh-core/domain/device-id";
 import { dmRoomPath } from "./room-path.js";
 import { loadRoomTokens } from "./identity-store.js";
-import { randomId } from "./random-id.js";
+import { sendMessageId } from "./send-message-id.js";
+import { rememberMessage } from "./message-history.js";
+import {
+  DeliveryReceipts,
+  PERSISTED_SEND_VERB,
+  type MeshSendOptions,
+  type MeshDmSendOptions,
+} from "./delivery-persistence.js";
 import { recordRoomSendNotice } from "./room-notice-log.js";
 import { CommsError } from "./store.js";
 import { describeRefusal } from "./send-outcome.js";
@@ -33,12 +40,16 @@ function deliveryFromOutcome(
   outcome: Readonly<Exclude<RoomRequestOutcome, { kind: "refused" }>>,
 ): MessageDelivery {
   return outcome.kind === "delivered"
-    ? { status: "delivered" }
+    ? {
+        status: "delivered",
+        ...(outcome.persisted === true && { persisted: true }),
+      }
     : { status: "queued", reason: outcome.reason };
 }
 
 /** The state and collaborators RoomMessaging needs from MeshStore. rooms/messages/dms are direct references into MeshStore's own fields; roomProtocol is the already-constructed instance (construction order: ... -\> roomProtocol -\> roomMessaging -\> ...), narrowed to what sending a message or DM ever needs; resolveAgent is AgentRegistry's own getAgent (deferred the same lazy-closure way DeliveryEngine's sendRoomRequestToMember closure is, since AgentRegistry doesn't exist yet at RoomMessaging's own construction point) rather than a bare `agents.get` lookup, so sendDm's own existence check also resolves a gossip-discovered agent (a remote, hub-learned one included, agent-comms#155) that will never appear in the agents map directly. */
 export interface RoomMessagingDeps {
+  deliveryReceipts?: DeliveryReceipts;
   rooms: Map<string, Room>;
   messages: Map<string, RoomMessage[]>;
   dms: Map<string, DmMessage[]>;
@@ -52,7 +63,10 @@ export interface RoomMessagingDeps {
 }
 
 export class RoomMessaging {
-  constructor(private readonly deps: RoomMessagingDeps) {}
+  private readonly deliveryReceipts: DeliveryReceipts;
+  constructor(private readonly deps: RoomMessagingDeps) {
+    this.deliveryReceipts = deps.deliveryReceipts ?? new DeliveryReceipts();
+  }
 
   /**
    * Sends a room message via a real, wire-authenticated room.send fan-out (P3.5): one directed request per member, each carrying this sender's own persisted room:member token, rather than the legacy broadcastPatch's full-state replication. A member unreachable right now is queued for retry (see sendRoomRequestToMember/flushPendingRoomRequests) instead of blocking or failing the whole send -- delivery to any one recipient is independent of every other.
@@ -65,9 +79,10 @@ export class RoomMessaging {
     roomIdOrName: string,
     from: string,
     content: string,
-    options?: SendRoomMessageOptions,
+    options?: SendRoomMessageOptions & MeshSendOptions,
   ): Promise<SentRoomMessage> {
     const { replyTo, streamingBehavior, durable } = options ?? {};
+    const messageId = sendMessageId(options?.messageId);
     const roomId = this.deps.resolveRoomId(roomIdOrName);
     const room = this.deps.rooms.get(roomId);
     if (!room)
@@ -93,9 +108,8 @@ export class RoomMessaging {
       );
     }
 
-    const messageId = randomId();
     const id = bytesToHex(messageId);
-    const message: RoomMessage = {
+    let message: RoomMessage = {
       id,
       from,
       room: roomId,
@@ -107,11 +121,15 @@ export class RoomMessaging {
     };
 
     const arr = this.deps.messages.get(roomId) ?? [];
-    arr.push(message);
-    this.deps.messages.set(roomId, arr);
+    const remembered = rememberMessage(arr, message);
+    message = remembered.message;
+    this.deps.messages.set(roomId, remembered.history);
 
     const params: Record<string, unknown> = {
-      verb: "room.send",
+      verb:
+        options?.requirePersistence === true
+          ? PERSISTED_SEND_VERB
+          : "room.send",
       "message-id": messageId,
       "sent-at": clock.now(),
       text: content,
@@ -165,8 +183,12 @@ export class RoomMessaging {
     from: string,
     to: string,
     content: string,
-    streamingBehavior?: StreamingBehavior,
+    input?: StreamingBehavior | MeshDmSendOptions,
   ): Promise<SentDm> {
+    const options =
+      typeof input === "string" ? { streamingBehavior: input } : input;
+    const streamingBehavior = options?.streamingBehavior;
+    const messageId = sendMessageId(options?.messageId);
     if (to !== from) {
       const recipient = await this.deps.resolveAgent(to);
       if (!recipient)
@@ -179,9 +201,8 @@ export class RoomMessaging {
     const token =
       to === from ? undefined : await this.dmRoomMemberToken(from, to);
 
-    const messageId = randomId();
     const id = bytesToHex(messageId);
-    const message: DmMessage = {
+    let message: DmMessage = {
       id,
       from,
       to,
@@ -194,16 +215,38 @@ export class RoomMessaging {
     // Self-DM is a purely local scratchpad note -- it never leaves the process, so it needs no room-path and dmRoomPath's own a===b refusal (a path naming the same device twice is not a valid DM path at all) correctly does not apply.
     const key = to === from ? `self:${from}` : dmRoomPath(from, to);
     const arr = this.deps.dms.get(key) ?? [];
-    arr.push(message);
-    this.deps.dms.set(key, arr);
 
-    // A self-DM never leaves the process, so it is already exactly as delivered as it will ever be by the time it is recorded above.
-    if (token === undefined)
-      return { message, delivery: { status: "delivered" } };
+    // A self-DM has no remote receipt: commit locally before recording success.
+    if (token === undefined) {
+      const receipt = await this.deliveryReceipts.accept(
+        key,
+        to,
+        { type: "dm", message },
+        options?.requirePersistence === true,
+      );
+      if (!receipt.ok) throw new CommsError(receipt.code, "SEND_REFUSED");
+      const remembered = rememberMessage(arr, message);
+      message = remembered.message;
+      this.deps.dms.set(key, remembered.history);
+      return {
+        message,
+        delivery: {
+          status: "delivered",
+          ...(receipt.persisted && { persisted: true }),
+        },
+      };
+    }
+
+    const remembered = rememberMessage(arr, message);
+    message = remembered.message;
+    this.deps.dms.set(key, remembered.history);
 
     const { clock } = this.deps.requireIdentity();
     const params: Record<string, unknown> = {
-      verb: "room.send",
+      verb:
+        options?.requirePersistence === true
+          ? PERSISTED_SEND_VERB
+          : "room.send",
       "message-id": messageId,
       "sent-at": clock.now(),
       text: content,
