@@ -12,13 +12,14 @@ const TRANSIENT_OUTCOME_CODES: ReadonlyMap<string, TransientSendFailure> =
     ["not_connected", "not_connected"],
     // This side's own transport answering that it has nowhere to send the request (no session, and no gateway willing to relay for that device). Reported as not_connected because that is exactly what it means to the sender: no route to the recipient existed when the request was attempted.
     ["no_route", "not_connected"],
+    ["delivery_storage_failed", "storage_unavailable"],
   ]);
 
 /**
  * What became of one directed room-domain request. `undelivered` is the retryable class: the recipient never answered, so the request may still succeed later and is worth holding. `refused` is terminal: the recipient did answer, with a failure it will give again, so the sender is told now rather than waiting on a retry that cannot help.
  */
 export type RoomRequestOutcome =
-  | { kind: "delivered" }
+  | { kind: "delivered"; persisted?: true }
   | { kind: "undelivered"; reason: TransientSendFailure }
   | { kind: "refused"; code: string; message?: string };
 
@@ -26,7 +27,13 @@ export type RoomRequestOutcome =
 export function classifyManageOutcome(
   outcome: Readonly<ManageOutcome>,
 ): RoomRequestOutcome {
-  if (outcome.result === "ok") return { kind: "delivered" };
+  if (outcome.result === "ok")
+    return {
+      kind: "delivered",
+      ...(outcome["delivery-receipt"] === "persisted" && {
+        persisted: true as const,
+      }),
+    };
   const reason = TRANSIENT_OUTCOME_CODES.get(outcome.code);
   if (reason !== undefined) return { kind: "undelivered", reason };
   return {

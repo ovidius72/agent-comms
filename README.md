@@ -295,6 +295,62 @@ agent_comms({ action: "read_room", room: "general" })
 agent_comms({ action: "update", visibility: "hidden" })
 ```
 
+## Persisted delivery receipts (fork API)
+
+This fork adds optional persisted acceptance to the public `MeshStore` and
+`createBridgeMesh` APIs. Existing callers keep their current behavior. Installing
+the fork alone does not make the CLI or native harness bridges durable: their
+host must configure and consume a persistent inbox.
+
+Pass `deliveryPersistence` when constructing a store or bridge. Its exported
+`DeliveryPersistence` interface has one method, `accept(delivery)`, which must:
+
+- Atomically insert the supplied `StoredDelivery.key` and its complete record,
+  or return the record already stored under that key.
+- Commit to durable storage **before** resolving, returning
+  `{ delivery: storedRecord, inserted: true | false }`.
+- Reject if storage fails or is full. Never overwrite conflicting content or
+  silently discard deduplication records while retries remain supported.
+
+The host owns the storage implementation, capacity, retention and pending-record
+replay. No database or conversation archive is created automatically. The key is
+scoped to recipient, room, authenticated sender and wire message ID. The library
+checks immutable content, ignores mutable read/timestamp metadata on retries and
+does not invoke delivery observers again for an already accepted message.
+
+For a required receipt, send through the concrete `MeshStore` API:
+
+```typescript
+const sent = await store.sendDm(senderId, recipientId, content, {
+  messageId, // Persist this nonempty, even-length hex ID before the first attempt.
+  requirePersistence: true,
+  streamingBehavior: "followUp",
+});
+```
+
+`sendRoomMessage(room, sender, content, options)` accepts the same `messageId`
+and `requirePersistence` fields alongside its existing options. DM callers may
+still pass a streaming-behavior string as the fourth argument. The shared
+`CommsStore` interface and `FileStore` do not advertise these mesh-only guarantees.
+
+A successful persisted receipt is `{ status: "delivered", persisted: true }`;
+room sends report it separately for each member. It means the recipient's
+configured inbox committed the message, **not** that a human read it or a model
+executed it. A crash after commit but before callback or receipt can leave a
+pending stored message: the host must recover it from its inbox. Model execution
+is not exactly-once and is not automatically replayed by this API.
+
+Required sends use `room.send.persisted` under the existing room authorization.
+Old peers reject that verb without delivering; configured peers retain the same
+token checks as ordinary sends. An unconfigured receiver refuses with
+`delivery_persistence_unsupported`; changed content under an accepted ID is
+`message_id_conflict`. Storage failure is retryable `storage_unavailable`, never
+a successful receipt. Automatic transport retries retain the ID but their queue
+is still bounded and in memory; a sender crash requires host-owned recovery.
+An explicit retry must reuse the ID and content. Supplying a new ID is a new
+message. The older `durable: true` room option still records a sender-side signed
+notice; it does not provide this receiver receipt or automatic offline fetch.
+
 ## Delivery timing
 
 `send` and `dm` accept an optional `streamingBehavior` field that tells the receiving bridge how urgently to surface the message:

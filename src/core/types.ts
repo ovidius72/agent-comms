@@ -176,6 +176,7 @@ export const TransientSendFailureSchema = defineSchema(
     z.literal("timeout"),
     z.literal("not_connected"),
     z.literal("connection_lost"),
+    z.literal("storage_unavailable"),
   ]),
 );
 export type TransientSendFailure = z.infer<typeof TransientSendFailureSchema>;
@@ -187,7 +188,10 @@ export type TransientSendFailure = z.infer<typeof TransientSendFailureSchema>;
  */
 export const MessageDeliverySchema = defineSchema(
   z.discriminatedUnion("status", [
-    z.object({ status: z.literal("delivered") }),
+    z.object({
+      status: z.literal("delivered"),
+      persisted: z.literal(true).optional(),
+    }),
     z.object({ status: z.literal("read") }),
     z.object({
       status: z.literal("queued"),

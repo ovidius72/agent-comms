@@ -33,6 +33,7 @@ import { getOwnPackageVersion } from "./package-version.js";
 import { loadOrCreateUserIdentity } from "./user-identity.js";
 import { loadOrCreateMachineIdentity } from "./machine-identity.js";
 import { resolveDataDir } from "./data-directory.js";
+import type { DeliveryPersistence } from "./delivery-persistence.js";
 
 export interface BridgeMesh {
   store: MeshStore;
@@ -46,6 +47,8 @@ export interface BridgeMeshSync extends BridgeMesh {
 
 /** coordinatorPort/hubUrl thread straight into MeshStore's own constructor, hubUrl defaulting here and nowhere below to resolveHubUrl() (AGENT_COMMS_HUB_URL, else the production hub); fetchLatestVersion is exposed purely for tests -- every real caller omits it and gets VersionDriftChecker's own default (a real npm registry lookup). firstContactPort defaults to FIRST_CONTACT_PORT, the default-on coordinator-free formation presence (agent-comms#341); a bridge-level test overrides it with an OS-assigned free port so test bridges never cross-discover each other, and false builds a store with no presence at all, for a store that lives in a process whose own store already runs one (the cc-peer front's per-session stores, agent-comms#476). */
 export interface BridgeMeshOptions {
+  /** Optional persistent message acceptance; ordinary delivery observers remain non-blocking. */
+  deliveryPersistence?: DeliveryPersistence | undefined;
   coordinatorPort?: number | undefined;
   hubUrl?: string | undefined;
   fetchLatestVersion?: (() => Promise<string | undefined>) | undefined;
@@ -85,12 +88,14 @@ export function createBridgeMeshSyncFromIdentity(
     hubUrl = resolveHubUrl(),
     fetchLatestVersion,
     firstContactPort = FIRST_CONTACT_PORT,
+    deliveryPersistence,
   } = options ?? {};
   // Account and machine keys are shared within the configured data directory, not scoped to the device's harness/cwd. Legacy slot.dir still overrides only the device's own files.
   const userIdentityOptions = { dir: resolveDataDir({ dir: slot.dataDir }) };
   const userIdentity = loadOrCreateUserIdentity(userIdentityOptions);
   const machineIdentity = loadOrCreateMachineIdentity(userIdentityOptions);
   const store = new MeshStore({
+    deliveryPersistence,
     coordinatorPort,
     hubUrl,
     slot,

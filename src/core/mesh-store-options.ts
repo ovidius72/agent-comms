@@ -3,9 +3,12 @@
  */
 
 import type { IdentitySlot } from "./identity-store.js";
+import type { DeliveryPersistence } from "./delivery-persistence.js";
 
 /** Construction options for MeshStore. */
 export interface MeshStoreOptions {
+  /** Durably accept authenticated incoming messages before acknowledging their delivery. */
+  readonly deliveryPersistence?: DeliveryPersistence | undefined;
   /** Localhost TCP port the coordinator role is contested on. Defaults to DEFAULT_COORDINATOR_PORT. */
   readonly coordinatorPort?: number | undefined;
   /** The relay hub this store holds its own session on from init until shutdown, so it is reachable from other machines whatever role it plays locally. Left out, the store never contacts a hub: only the bridge entry points name the production hub (bridge-mesh.ts), so a store built by anything else, a test included, stays local. */
