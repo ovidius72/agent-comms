@@ -305,6 +305,10 @@ export class RoomLifecycle {
         token,
       );
     if (outcome.result !== "ok") {
+      // Only an authoritative denial invalidates a cached grant, not a network failure.
+      if (outcome.code === "unauthorized" || outcome.code === "not_a_member") {
+        deleteRoomToken(slot, roomPath);
+      }
       throw new CommsError(
         `room.members refresh for ${roomPath} failed (${outcome.code})`,
         "REFRESH_FAILED",
@@ -379,7 +383,9 @@ export class RoomLifecycle {
   }
 
   /**
-   * Joins a room. For this store's own identity, "already known locally" is not the right gate for skipping real admission: the legacy full-state-sync replicates a room's metadata to every mesh-connected peer the moment it's created, well before that peer has ever been admitted, so a room already present in this.rooms says nothing about whether this store actually holds a valid room:member token for it. The real gate is that token's presence -- absent, this always goes through joinRemoteRoom's real wire-level admission regardless of what this.rooms already knows, so a peer that merely heard about a room never mistakes hearing about it for having joined it. Joining on behalf of a DIFFERENT agentId (this store's own convergence/admin bookkeeping, exercised directly by state-sync-convergence.test.ts) is untouched -- that's a pure local CRDT mutation with no admission concept at all.
+   * A cached grant for another owner's room is revalidated by that owner's room.members
+   * handler. This also works after restart, before any revocation gossip arrives.
+   * Without a grant, request fresh admission. Owner-local bookkeeping stays local.
    */
   async joinRoom(roomIdOrName: string, agentId: string): Promise<Room> {
     const roomId = this.resolveRoomId(roomIdOrName);
@@ -388,6 +394,10 @@ export class RoomLifecycle {
       const { slot } = this.deps.requireIdentity();
       if (loadRoomTokens(slot)[roomId] === undefined) {
         return this.joinRemoteRoom(roomId, agentId);
+      }
+      const path = parseRoomPath(roomId);
+      if (path.kind === "owner-named" && path.owner !== peerId) {
+        return this.refreshRoomMembers(roomId);
       }
     }
     const room = this.deps.rooms.get(roomId);

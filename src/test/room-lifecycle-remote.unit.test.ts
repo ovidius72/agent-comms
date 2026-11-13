@@ -262,7 +262,30 @@ describe("RoomLifecycle — refreshRoomMembers", () => {
       message: `room.members refresh for ${roomPath} failed (not_a_member)`,
       code: "REFRESH_FAILED",
     });
+    expect(loadRoomTokens(slot)[roomPath]).toBeUndefined();
   });
+
+  it.each(["unauthorized", "not_connected"])(
+    "handles a cached grant after %s without confusing denial and network failure",
+    async (code) => {
+      const h = await makeHarness();
+      const roomPath = ownerNamedRoomPath(h.ids.memberId, "r");
+      const { slot } = h.deps.requireIdentity();
+      const token = await mintRoomToken(
+        h.ids.ownerPort,
+        h.ids.ownerId,
+        roomPath,
+      );
+      saveRoomToken(slot, roomPath, token);
+      h.sendRoomRequest.mockResolvedValue({ result: "error", code });
+      await expect(
+        h.lifecycle.refreshRoomMembers(roomPath),
+      ).rejects.toMatchObject({ code: "REFRESH_FAILED" });
+      expect(loadRoomTokens(slot)[roomPath]).toEqual(
+        code === "unauthorized" ? undefined : token,
+      );
+    },
+  );
 
   it("throws MALFORMED_RESPONSE when the outcome fails the roomMembersOk schema", async () => {
     const h = await makeHarness();

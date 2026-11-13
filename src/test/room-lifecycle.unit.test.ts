@@ -457,7 +457,7 @@ describe("RoomLifecycle — joinRoom / joinRemoteRoom", () => {
     expect(h.sendRoomRequest).toHaveBeenCalled();
   });
 
-  it("skips the remote round trip when a local token already exists and the room is known", async () => {
+  it("revalidates a cached token with the room owner instead of mutating membership locally", async () => {
     const h = await makeHarness();
     const roomPath = ownerNamedRoomPath(h.ids.memberId, "shared");
     h.deps.rooms.set(
@@ -472,8 +472,15 @@ describe("RoomLifecycle — joinRoom / joinRemoteRoom", () => {
     const { slot } = h.deps.requireIdentity();
     const token = await mintRoomToken(h.ids.ownerPort, h.ids.ownerId, roomPath);
     saveRoomToken(slot, roomPath, token);
+    h.sendRoomRequest.mockResolvedValue({ result: "ok", members: [] });
     await h.lifecycle.joinRoom(roomPath, h.ids.ownerId);
-    expect(h.sendRoomRequest).not.toHaveBeenCalled();
+    expect(h.sendRoomRequest).toHaveBeenCalledWith(
+      h.ids.memberId,
+      { verb: "room:member", params: { verb: "room.members" } },
+      { kind: "room", path: roomPath },
+      token,
+    );
+    expect(h.broadcastPatch).not.toHaveBeenCalled();
   });
 
   it("always takes the local CRDT path for an agent other than this store's own peer, regardless of tokens", async () => {
