@@ -5,17 +5,10 @@
  */
 
 import { test, expect } from "vitest";
-import { deviceIdFromHex } from "wire-mesh-core/domain/device-id";
-import { createSystemClock } from "wire-mesh-core/adapters/system-clock";
-import { mintCapabilityToken } from "wire-mesh-core/domain/tokens";
 import { MeshStore } from "../core/mesh-store.js";
 import type { SerialisedState } from "../core/wire-protocol.js";
 import { ownerNamedRoomPath } from "../core/room-path.js";
-import { loadOrCreateIdentity, saveRoomToken } from "../core/identity-store.js";
-import { toIdentityPort } from "../core/wire-mesh-identity.js";
 import { wireTestTransport } from "./test-transport.js";
-
-const GRANT_EXPIRY_MS = 60_000;
 
 /** A local-only store: transport is set (registerAgent's own broadcastPatch needs one) but never started, so no ports and no flake -- the stores in these tests never actually connect. */
 async function makeStore(): Promise<MeshStore> {
@@ -80,7 +73,7 @@ test("a current holder rejects a stale snapshot instead of regressing", async ()
 test("room membership changes converge and stale member lists are rejected", async () => {
   const a = await makeStore();
   const b = new MeshStore();
-  const bSlot = await wireTestTransport(b);
+  await wireTestTransport(b);
   const owner = await a.registerAgent({
     name: "owner",
     harness: "pi",
@@ -105,35 +98,16 @@ test("room membership changes converge and stale member lists are rejected", asy
     description: "x",
   });
 
-  // A holds the room before the join; the joiner lives on B, so the join mutates B's copy and syncs back (one MeshStore is one peer identity, so a second agent cannot be registered on A).
+  // The owner is the authority on membership; a peer cannot join by editing its replica.
   a.applyStateSync(snapshotOf(b));
   b.applyStateSync(snapshotOf(a));
   expect((await a.getRoom(roomId))?.members.includes(joiner.id)).toBe(false);
 
-  // joiner.id is B's own peerId (registerAgent's own id is always this.peerId), so this is a real self-join as far as joinRoom's own admission gate is concerned -- give B a token for the room first so the gate sees an already-admitted member and exercises the CRDT membership-merge logic this test actually targets, not a real (and here, transport-free, therefore impossible) wire-level join.
-  const bClock = createSystemClock();
-  const bIdentity = await toIdentityPort(loadOrCreateIdentity(bSlot));
-  const grantVerdict = await mintCapabilityToken({
-    identity: bIdentity,
-    clock: bClock,
-    tokenId: new Uint8Array([1]),
-    bearer: deviceIdFromHex(joiner.id),
-    capability: "room:member",
-    scope: { kind: "room", path: roomId },
-    expires: bClock.now() + GRANT_EXPIRY_MS,
-    delegationsRemaining: 0,
-  });
-  expect(
-    grantVerdict.ok,
-    "expected the fixture grant to mint successfully",
-  ).toBeTruthy();
-  if (grantVerdict.ok) saveRoomToken(bSlot, roomId, grantVerdict.token);
-
-  await b.joinRoom(roomId, joiner.id);
-  a.applyStateSync(snapshotOf(b));
+  await a.joinRoom(roomId, joiner.id);
+  b.applyStateSync(snapshotOf(a));
   expect((await a.getRoom(roomId))?.members.includes(joiner.id)).toBe(true);
 
-  // The joiner leaves. Unlike the join step above, there is no token-presence gate to skip here: any genuine member always already holds one, so leaveRoom's own self-leave gate (P3.8) always routes joiner.id === b.peerId through a real, and here impossible, wire round trip to the room's owner. Run the leave on A (the room's real owner) instead -- joiner.id !== a.peerId there, so it takes the same pure local CRDT branch the "kicker" test below already exercises -- and let B converge to A's own now-current state, exactly mirroring the join step's own direction reversed.
+  // Owner-side bookkeeping changes converge to the member's projection.
   await a.leaveRoom(roomId, joiner.id);
   b.applyStateSync(snapshotOf(a));
   expect((await a.getRoom(roomId))?.members.includes(joiner.id)).toBe(false);

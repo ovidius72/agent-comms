@@ -101,6 +101,13 @@ export class DeliveryEngine {
    */
   private mergeRoom(incoming: Room): void {
     const existing = this.deps.rooms.get(incoming.id);
+    // The owner processes admission and revocation itself. Peer copies are projections,
+    // never authority to restore a kicked member, even at a higher sync revision.
+    if (
+      existing?.owner === this.deps.getPeerId() ||
+      incoming.owner === this.deps.getPeerId()
+    )
+      return;
     if (existing === undefined) {
       this.refreshMembership(incoming);
       this.deps.rooms.set(incoming.id, incoming);
@@ -441,8 +448,12 @@ export class DeliveryEngine {
       return;
     }
     const eventKey = JSON.stringify(event);
-    if (this.deps.localDeliveryKeys.has(eventKey)) return;
-    this.deps.localDeliveryKeys.add(eventKey);
+    // Each new pending admission needs a decision, even for a previously admitted peer.
+    // Transient requests are never replayed by applyStateSync.
+    if (event.type !== "room_join_request") {
+      if (this.deps.localDeliveryKeys.has(eventKey)) return;
+      this.deps.localDeliveryKeys.add(eventKey);
+    }
     // Prevent unbounded growth — evict oldest when cap reached
     if (this.deps.localDeliveryKeys.size > MAX_LOCAL_DELIVERY_DEDUP_KEYS) {
       const oldest = this.deps.localDeliveryKeys.values().next().value;

@@ -441,6 +441,21 @@ Names must be non-empty, at most 64 characters, and free of control characters. 
 
 ## Room types
 
+### Rejoining after removal (fork fix)
+
+A saved membership token is not proof of current admission. Rejoining another
+device's room checks the token with that room's owner through `room.members`.
+The owner verifies its signature, bearer, scope, expiry and revocation. A refusal
+removes the cached token; the next join requests fresh approval. A connection
+failure leaves the token intact and reports failure instead of granting access.
+The owner never accepts peer snapshots or room upserts as replacements for its own
+room record. Other devices still hold projections that may be stale.
+
+Each new pending join is delivered to the owner, including a later request from
+a previously removed member. A still-valid member can rejoin after restart
+without another approval. This does not replace the legacy state-sync protocol
+with a fully authenticated replica protocol or persist room state for the host.
+
 | Type      | Discovery              | Join        | Read history |
 | --------- | ---------------------- | ----------- | ------------ |
 | `public`  | Listed in `list_rooms` | Anyone      | Anyone       |
