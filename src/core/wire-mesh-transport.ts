@@ -11,10 +11,10 @@
 import { createTlsTransport } from "wire-mesh-core/adapters/tls-transport";
 import {
   ROOM_JOIN_APPROVAL_TIMEOUT_MS,
-  ROOM_REQUEST_TIMEOUT_MS,
   manageRequestTimeoutMs,
 } from "./request-timeouts.js";
 import { dialRemote } from "./ws-dial.js";
+import { TransportRequests } from "./transport-requests.js";
 import { HubSession } from "./hub-session.js";
 import { PRESENCE_READVERTISE_INTERVAL_MS } from "./gossip-extensions.js";
 import { GatewayTrust, type GatewayTrustReader } from "./gateway-trust.js";
@@ -146,6 +146,10 @@ export class WireMeshTransport implements MeshTransport {
   private _dataPort = 0;
   private _isCoordinator = false;
   private shutDown = false;
+  private readonly requests = new TransportRequests(
+    () => this.isShuttingDown(),
+    FRAME_SCOPE,
+  );
 
   /** A method call, not a direct property read -- deliberately, so TS's control-flow narrowing (which does track `this.shutDown` as staying false for the rest of a function once an early `if (this.shutDown) return` has passed, with no awareness that an `await` in between gave a concurrent shutdown() call the chance to flip it) doesn't treat every later re-check in the same async function as unreachable. Each of these re-checks is real: shutdown() can run at any time this function is suspended on an await. */
   private isShuttingDown(): boolean {
@@ -615,10 +619,9 @@ export class WireMeshTransport implements MeshTransport {
     }
     this.coordinatorSession = session;
     // Fire-and-forget, matching the previous transport's own contract: this resolves once the introduction is sent, not once a response arrives; peer_list/peer_joined/become_coordinator arrive asynchronously via the normal dispatch path below, independent of this call's own promise. Written before the session is enrolled below, because enrolling announces the elected coordinator over it and the port holder drops any claim that reaches it ahead of the introduce.
-    void this.sendFrame(
-      session,
-      buildCommand({ method: "introduce", peerId, dataPort }),
-    ).catch(() => undefined);
+    void this.requests
+      .frame(session, buildCommand({ method: "introduce", peerId, dataPort }))
+      .catch(() => undefined);
     const coordinatorDeviceId = connection.peerDeviceId;
     if (coordinatorDeviceId !== undefined) {
       const handle: ConnectionHandle = {
@@ -716,34 +719,20 @@ export class WireMeshTransport implements MeshTransport {
   ): Promise<void> {
     const session = this.peerSessions.get(handle.id);
     if (session === undefined) return;
-    await this.sendFrame(session, buildCommand(message)).catch(
-      (error: unknown) => {
+    await this.requests
+      .frame(session, buildCommand(message))
+      .catch((error: unknown) => {
         this.events.onError?.(
           new PeerLinkError("send", handle.id, undefined, error),
         );
-      },
-    );
-  }
-
-  /** Sends one opaque MeshMessage frame over a session under the ordinary network deadline. The deadline is what makes it safe to await: wire-mesh-core waits forever for a manage-response when given none, so a frame sent to a peer whose socket has already died but whose close this side has not yet observed would never settle, and MeshStore.shutdown() awaits exactly such a broadcast on its way out. */
-  private async sendFrame(
-    session: AcceptedMeshSession,
-    command: ManageCommand,
-  ): Promise<ManageOutcome> {
-    return session.sendManageRequest(
-      command,
-      FRAME_SCOPE,
-      undefined,
-      undefined,
-      ROOM_REQUEST_TIMEOUT_MS,
-    );
+      });
   }
 
   async broadcast(message: MeshMessage): Promise<void> {
     const command = buildCommand(message);
     await Promise.all(
       [...this.peerSessions.values()].map(async (session) =>
-        this.sendFrame(session, command).catch(() => undefined),
+        this.requests.frame(session, command).catch(() => undefined),
       ),
     );
   }
@@ -781,15 +770,17 @@ export class WireMeshTransport implements MeshTransport {
     scope: Readonly<CapabilityScope>,
     token?: CapabilityToken,
   ): Promise<ManageOutcome> {
+    if (this.isShuttingDown())
+      return { result: "error", code: "shutting_down" };
     const session = this.peerSessions.get(memberId);
     if (session !== undefined) {
-      return session.sendManageRequest(
-        command,
-        scope,
-        undefined,
+      return this.requests.send(session, command, scope, {
         token,
-        manageRequestTimeoutMs(command, this.roomJoinApprovalTimeoutMs),
-      );
+        timeoutMs: manageRequestTimeoutMs(
+          command,
+          this.roomJoinApprovalTimeoutMs,
+        ),
+      });
     }
     // no_route, never unauthorized: this side has nowhere to send the request, which is a fact about this side's own routing rather than an answer from memberId, and a caller must be able to tell the two apart. A device with no session that this side is willing to relay for may become reachable later, once it connects or once an operator trusts it, so a request for it is worth holding; a request the recipient itself refused never is.
     if (!this.gatewayTrust.isReachable(memberId)) {
@@ -826,7 +817,8 @@ export class WireMeshTransport implements MeshTransport {
     if (session === undefined) {
       throw new Error("connectToRemote: the transport has shut down");
     }
-    const outcome = await session.sendManageRequest(
+    const outcome = await this.requests.send(
+      session,
       buildCommand({
         method: "connect_request",
         peerId,
